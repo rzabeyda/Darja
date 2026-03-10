@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+booking.db
+bookings.json
+.idea/
