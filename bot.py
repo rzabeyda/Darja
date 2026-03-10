@@ -1,79 +1,230 @@
 import asyncio
 import calendar
-import json
 import os
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    ReplyKeyboardMarkup, KeyboardButton,
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 
-API_TOKEN = "8722047645:AAEG7wE-82ZI3CyBL14Mh4UQy3GT9J5bxL8"
-ADMIN_ID = 7308147004
+# ─── Конфиг ───────────────────────────────────────────────────────────────────
+
+API_TOKEN   = os.getenv("API_TOKEN")
+
+ADMIN_IDS = set()
+for _key in ("ADMIN_ID", "ADMIN_ID2", "ADMIN_ID3"):
+    _val = os.getenv(_key)
+    if _val:
+        ADMIN_IDS.add(int(_val))
 
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp  = Dispatcher(storage=MemoryStorage())
 
-# ─── Постоянное хранилище броней в файле ─────────────────────────────────────
-BOOKINGS_FILE = "bookings.json"
+# ─── SQLite ───────────────────────────────────────────────────────────────────
 
-def load_bookings() -> tuple[dict, int]:
-    """Загружает брони из файла. Возвращает (bookings, max_id)."""
-    if not os.path.exists(BOOKINGS_FILE):
-        return {}, 0
-    try:
-        with open(BOOKINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Ключи в JSON всегда строки — конвертируем обратно в int
-        bk = {int(k): v for k, v in data.get("bookings", {}).items()}
-        counter = data.get("counter", 0)
-        return bk, counter
-    except Exception:
-        return {}, 0
+DB_FILE = "bot.db"
 
-def save_bookings():
-    """Сохраняет текущие брони в файл."""
-    try:
-        with open(BOOKINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"bookings": bookings, "counter": booking_counter}, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Ошибка сохранения броней: {e}")
 
-# Загружаем при старте
-bookings, booking_counter = load_bookings()
+def db_connect():
+    return sqlite3.connect(DB_FILE)
 
-# Длительность сеанса — 2 часа (в слотах по 1 часу)
-SESSION_HOURS = 2
+
+def init_db():
+    con = db_connect()
+    cur = con.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            service     TEXT NOT NULL,
+            year        INTEGER NOT NULL,
+            month       INTEGER NOT NULL,
+            day         INTEGER NOT NULL,
+            time        TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            phone       TEXT NOT NULL,
+            reminded_24 INTEGER DEFAULT 0,
+            reminded_2  INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS schedule (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            type    TEXT NOT NULL,   -- 'day' or 'slot'
+            date    TEXT NOT NULL,   -- YYYY-MM-DD
+            time    TEXT             -- HH:MM or NULL for full day
+        );
+    """)
+    con.commit()
+    con.close()
+
+
+init_db()
+
+
+# ─── CRUD брони ───────────────────────────────────────────────────────────────
+
+def add_booking(user_id: int, service: str, year: int, month: int, day: int,
+                time: str, name: str, phone: str) -> int:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO bookings (user_id,service,year,month,day,time,name,phone) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (user_id, service, year, month, day, time, name, phone)
+    )
+    bid = cur.lastrowid
+    con.commit(); con.close()
+    return bid
+
+
+def remove_booking(bid: int):
+    con = db_connect()
+    con.execute("DELETE FROM bookings WHERE id=?", (bid,))
+    con.commit(); con.close()
+
+
+def get_booking(bid: int) -> dict | None:
+    con = db_connect()
+    cur = con.execute("SELECT * FROM bookings WHERE id=?", (bid,))
+    row = cur.fetchone()
+    con.close()
+    return _row_to_booking(row) if row else None
+
+
+def get_user_bookings(user_id: int) -> list[dict]:
+    con = db_connect()
+    cur = con.execute(
+        "SELECT * FROM bookings WHERE user_id=? ORDER BY year,month,day,time",
+        (user_id,)
+    )
+    rows = cur.fetchall(); con.close()
+    return [_row_to_booking(r) for r in rows]
+
+
+def get_all_bookings() -> list[dict]:
+    con = db_connect()
+    cur = con.execute("SELECT * FROM bookings ORDER BY year,month,day,time")
+    rows = cur.fetchall(); con.close()
+    return [_row_to_booking(r) for r in rows]
+
+
+def update_booking_field(bid: int, field: str, value):
+    allowed = {"service", "year", "month", "day", "time", "name", "phone"}
+    if field not in allowed:
+        return
+    con = db_connect()
+    con.execute(f"UPDATE bookings SET {field}=? WHERE id=?", (value, bid))
+    con.commit(); con.close()
+
+
+def _row_to_booking(row) -> dict:
+    return {
+        "id": row[0], "user_id": row[1], "service": row[2],
+        "year": row[3], "month": row[4], "day": row[5],
+        "time": row[6], "name": row[7], "phone": row[8],
+        "reminded_24": row[9], "reminded_2": row[10],
+    }
+
+
+# ─── CRUD расписания ──────────────────────────────────────────────────────────
+
+def block_day(date: str):
+    con = db_connect()
+    con.execute("INSERT OR IGNORE INTO schedule (type,date) VALUES ('day',?)", (date,))
+    con.commit(); con.close()
+
+
+def unblock_day(date: str):
+    con = db_connect()
+    con.execute("DELETE FROM schedule WHERE type='day' AND date=?", (date,))
+    con.commit(); con.close()
+
+
+def block_slot(date: str, time: str):
+    con = db_connect()
+    con.execute("INSERT OR IGNORE INTO schedule (type,date,time) VALUES ('slot',?,?)", (date, time))
+    con.commit(); con.close()
+
+
+def unblock_slot(date: str, time: str):
+    con = db_connect()
+    con.execute("DELETE FROM schedule WHERE type='slot' AND date=? AND time=?", (date, time))
+    con.commit(); con.close()
+
+
+def get_blocked_days() -> list[str]:
+    con = db_connect()
+    cur = con.execute("SELECT date FROM schedule WHERE type='day'")
+    rows = cur.fetchall(); con.close()
+    return [r[0] for r in rows]
+
+
+def get_blocked_slots_for_date(date: str) -> list[str]:
+    con = db_connect()
+    cur = con.execute("SELECT time FROM schedule WHERE type='slot' AND date=?", (date,))
+    rows = cur.fetchall(); con.close()
+    return [r[0] for r in rows]
+
+
+def get_all_blocked_slots() -> dict:
+    con = db_connect()
+    cur = con.execute("SELECT date,time FROM schedule WHERE type='slot' ORDER BY date,time")
+    rows = cur.fetchall(); con.close()
+    result = {}
+    for date, time in rows:
+        result.setdefault(date, []).append(time)
+    return result
+
+# ─── Контакты ─────────────────────────────────────────────────────────────────
+
+CONTACTS_FULL = (
+    "📞 +372 56 602 890\n"
+    "💬 Telegram: @Vi_da_ch_iV\n"
+    "📬 Dariashabelna@gmail.com"
+)
+
+CONTACTS_SHORT = (
+    "📞 +372 56 602 890\n"
+    "🏠 Linnamäe tee 83-66\n"
+    "💬 Telegram: @Vi_da_ch_iV"
+)
+
+# ─── Услуги ───────────────────────────────────────────────────────────────────
 
 services = [
-    {"name": "Классический маникюр",           "price": "25€", "img": "images/klas.jpg"},
-    {"name": "Маникюр с гель-лаком, коррекция", "price": "25€", "img": "images/gel.jpg"},
-    {"name": "Наращивание ногтей",              "price": "35€", "img": "images/nara.jpg"},
-    {"name": "Гигиенический педикюр",           "price": "25€", "img": "images/pedik.jpg"},
-    {"name": "Педикюр с гель-лаком, коррекция", "price": "35€", "img": "images/pedik_gel.jpg"},
-    {"name": "Мужской SPA-педикюр",             "price": "30€", "img": "images/spa.jpg"},
-    {"name": "Снятие покрытия",                 "price": "15€", "img": "images/del.jpg"},
+    {"name": "Классический маникюр",            "price": "15€", "duration": "30 мин", "duration_slots": 1, "img": "images/klas.jpg"},
+    {"name": "Маникюр с гель-лаком / Коррекция","price": "25€", "duration": "60 мин", "duration_slots": 1, "img": "images/gel.jpg"},
+    {"name": "Наращивание ногтей",               "price": "35€", "duration": "120 мин","duration_slots": 2, "img": "images/nara.jpg"},
+    {"name": "Гигиенический педикюр",            "price": "25€", "duration": "45 мин", "duration_slots": 1, "img": "images/pedik.jpg"},
+    {"name": "Педикюр с гель-лаком",             "price": "35€", "duration": "60 мин", "duration_slots": 1, "img": "images/pedik_gel.jpg"},
+    {"name": "Мужской педикюр",                  "price": "30€", "duration": "60 мин", "duration_slots": 1, "img": "images/spa.jpg"},
+    {"name": "Снятие покрытия",                  "price": "10€", "duration": "15 мин", "duration_slots": 1, "img": "images/del.jpg"},
+    {"name": "Ремонт одного ногтя",              "price": "2€",  "duration": "15 мин", "duration_slots": 1, "img": "images/del.jpg"},
 ]
 
 MONTHS = {
-    1: "Январь",  2: "Февраль", 3: "Март",    4: "Апрель",
-    5: "Май",     6: "Июнь",    7: "Июль",    8: "Август",
-    9: "Сентябрь",10: "Октябрь",11: "Ноябрь", 12: "Декабрь"
+    1: "Январь",   2: "Февраль", 3: "Март",    4: "Апрель",
+    5: "Май",      6: "Июнь",    7: "Июль",    8: "Август",
+    9: "Сентябрь", 10: "Октябрь",11: "Ноябрь", 12: "Декабрь",
 }
 
-TIME_SLOTS = ["09:00", "10:00", "11:00", "12:00", "13:00",
-              "14:00", "15:00", "16:00", "17:00", "18:00", "19:00"]
+TIME_SLOTS = ["09:00","10:00","11:00","12:00","13:00",
+              "14:00","15:00","16:00","17:00"]
 
-
-# ─── FSM ─────────────────────────────────────────────────────────────────────
+# ─── FSM ──────────────────────────────────────────────────────────────────────
 
 class Booking(StatesGroup):
     service = State()
+    year    = State()
     month   = State()
     day     = State()
     time    = State()
@@ -83,6 +234,7 @@ class Booking(StatesGroup):
 
 class EditBooking(StatesGroup):
     service = State()
+    year    = State()
     month   = State()
     day     = State()
     time    = State()
@@ -90,109 +242,139 @@ class EditBooking(StatesGroup):
     phone   = State()
 
 
-# ─── Вспомогательные функции ─────────────────────────────────────────────────
+# ─── Вспомогательные функции ──────────────────────────────────────────────────
 
-def next_booking_id() -> int:
-    global booking_counter
-    booking_counter += 1
-    return booking_counter
-
-def add_booking(user_id: int, booking: dict):
-    """Добавляет бронь и сохраняет на диск."""
-    bookings.setdefault(user_id, []).append(booking)
-    save_bookings()
-
-def remove_booking(user_id: int, bid: int):
-    """Удаляет бронь и сохраняет на диск."""
-    if user_id in bookings:
-        bookings[user_id] = [x for x in bookings[user_id] if x["id"] != bid]
-        save_bookings()
+def get_service(name: str) -> dict | None:
+    return next((s for s in services if s["name"] == name), None)
 
 
-def get_booking(user_id: int, bid: int) -> dict | None:
-    for b in bookings.get(user_id, []):
-        if b["id"] == bid:
-            return b
-    return None
+def date_key(year: int, month: int, day: int) -> str:
+    return f"{year}-{month:02d}-{day:02d}"
 
 
-def get_all_bookings() -> list[dict]:
-    """Все брони всех пользователей, отсортированные по дате/времени"""
-    all_b = []
-    for uid, user_bookings in bookings.items():
-        for b in user_bookings:
-            all_b.append({**b, "user_id": uid})
-    all_b.sort(key=lambda x: (x["month"], x["day"], x["time"]))
-    return all_b
+def is_day_blocked(year: int, month: int, day: int) -> bool:
+    return date_key(year, month, day) in get_blocked_days()
 
 
-def get_blocked_slots(month: int, day: int, exclude_bid: int | None = None) -> set[str]:
-    """Возвращает множество заблокированных слотов на день (сам слот + SESSION_HOURS-1 после)"""
+def duration_minutes(svc: dict | None) -> int:
+    """Извлекает минуты из строки duration, например '30 мин' -> 30, '120 мин' -> 120."""
+    if not svc:
+        return 60
+    import re
+    m = re.search(r"(\d+)", svc["duration"])
+    return int(m.group(1)) if m else 60
+
+def get_end_time(start_slot: str, duration_minutes: int) -> str:
+    """duration_minutes — реальная длительность в минутах."""
+    h, m = int(start_slot.split(":")[0]), int(start_slot.split(":")[1])
+    total = h * 60 + m + duration_minutes
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def get_busy_indices(year: int, month: int, day: int, exclude_bid: int | None = None) -> set[int]:
+    """Индексы слотов реально занятых существующими бронями."""
+    busy = set()
+    for b in get_all_bookings():
+        if exclude_bid and b["id"] == exclude_bid:
+            continue
+        if b["year"] != year or b["month"] != month or b["day"] != day:
+            continue
+        svc = get_service(b["service"])
+        dur = svc["duration_slots"] if svc else 1
+        bi  = TIME_SLOTS.index(b["time"])
+        for i in range(dur):
+            if 0 <= bi + i < len(TIME_SLOTS):
+                busy.add(bi + i)
+    return busy
+
+
+def get_blocked_slots(year: int, month: int, day: int, exclude_bid: int | None = None,
+                      new_duration_slots: int = 1) -> set[str]:
+    """Слот S заблокирован если диапазон [S..S+dur-1] пересекается с занятыми."""
+    now = datetime.now()
     blocked = set()
-    for uid, user_bookings in bookings.items():
-        for b in user_bookings:
-            if exclude_bid and b["id"] == exclude_bid:
-                continue
-            if b["month"] == month and b["day"] == day:
-                booked_idx = TIME_SLOTS.index(b["time"])
-                # Блокируем booked_idx и SESSION_HOURS-1 слотов после
-                for i in range(SESSION_HOURS):
-                    idx = booked_idx + i
-                    if 0 <= idx < len(TIME_SLOTS):
-                        blocked.add(TIME_SLOTS[idx])
-                # Также блокируем слоты ДО, которые захватят этот момент
-                # (если кто-то запишется на час раньше, он тоже займёт этот слот)
-                for i in range(1, SESSION_HOURS):
-                    idx = booked_idx - i
-                    if 0 <= idx < len(TIME_SLOTS):
-                        blocked.add(TIME_SLOTS[idx])
+
+    # 1. Прошедшее время сегодня
+    if year == now.year and month == now.month and day == now.day:
+        for slot in TIME_SLOTS:
+            if int(slot.split(":")[0]) <= now.hour:
+                blocked.add(slot)
+
+    # 2. Мастер заблокировал вручную
+    key = date_key(year, month, day)
+    for slot in get_blocked_slots_for_date(key):
+        blocked.add(slot)
+
+    # 3. Пересечение с существующими бронями
+    busy = get_busy_indices(year, month, day, exclude_bid)
+    for s_idx in range(len(TIME_SLOTS)):
+        new_range = set(range(s_idx, s_idx + new_duration_slots))
+        if new_range & busy:
+            blocked.add(TIME_SLOTS[s_idx])
+
     return blocked
 
 
-def format_booking(b: dict, idx: int | None = None, show_user: bool = False) -> str:
+
+def format_booking(b: dict, idx: int | None = None) -> str:
     month_name = MONTHS[b["month"]]
-    prefix = f"*Бронь №{idx}*\n" if idx else ""
-    user_line = f"🆔 User ID: {b.get('user_id', '—')}\n" if show_user else ""
+    prefix     = f"Бронь №{idx}\n" if idx else ""
+    svc        = get_service(b["service"])
+    dur_slots  = svc["duration_slots"] if svc else 1
+    dur_str    = svc["duration"] if svc else ""
+    end_time   = get_end_time(b["time"], duration_minutes(svc))
     return (
         f"{prefix}"
-        f"💅 Услуга: {b['service']}\n"
-        f"📅 Дата: {b['day']} {month_name}\n"
-        f"🕐 Время: {b['time']}\n"
-        f"👤 Имя: {b['name']}\n"
-        f"📞 Телефон: {b['phone']}\n"
-        f"{user_line}"
-    )
+        f"💅 {b['service']} ({dur_str})\n"
+        f"📅 {b['day']} {month_name} {b['year']}\n"
+        f"🕐 {b['time']} — {end_time}\n"
+        f"👤 {b['name']}\n"
+        f"📞 {b['phone']}"
+    ).strip()
 
 
-# ─── Постоянная нижняя клавиатура ────────────────────────────────────────────
+# ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
 def bottom_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    buttons = [[
+    row = [
         KeyboardButton(text="💅 Услуги"),
         KeyboardButton(text="📋 Мои брони"),
-    ]]
+        KeyboardButton(text="📞 Контакты"),
+    ]
+    buttons = [row]
     if is_admin:
-        buttons[0].append(KeyboardButton(text="🔐 Админка"))
+        buttons.append([KeyboardButton(text="🔐 Админка")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
-# ─── Инлайн-клавиатуры ───────────────────────────────────────────────────────
-
 def main_menu_kb():
-    rows = [
-        [InlineKeyboardButton(text=f"{s['name']} — {s['price']}", callback_data=f"svc:{s['name']}")]
-        for s in services
-    ]
+    rows = []
+    for s in services:
+        label = f"{s['name']} — {s['price']} ({s['duration']})"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"svc:{s['name']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def months_kb():
+def years_kb() -> InlineKeyboardMarkup:
+    now = datetime.now()
+    buttons = []
+    for y in [now.year, now.year + 1]:
+        buttons.append(InlineKeyboardButton(text=str(y), callback_data=f"year:{y}"))
+    rows = [buttons, [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def months_kb(year: int) -> InlineKeyboardMarkup:
     now = datetime.now()
     rows, row = [], []
+    shown = 0
     for num, name in MONTHS.items():
         if num < now.month:
             continue
+        if shown >= 3:
+            break
         row.append(InlineKeyboardButton(text=name, callback_data=f"month:{num}"))
+        shown += 1
         if len(row) == 3:
             rows.append(row); row = []
     if row:
@@ -201,18 +383,29 @@ def months_kb():
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def days_kb(month: int):
+def days_kb(year: int, month: int, new_duration_slots: int = 1) -> InlineKeyboardMarkup:
     now = datetime.now()
-    _, days_in_month = calendar.monthrange(now.year, month)
+    _, days_in_month = calendar.monthrange(year, month)
     rows, row = [], []
     for day in range(1, days_in_month + 1):
-        if month == now.month and day < now.day:
+        # Пропускаем прошедшие дни
+        if year == now.year and month == now.month and day < now.day:
+            continue
+        # Пропускаем заблокированные дни
+        if is_day_blocked(year, month, day):
+            continue
+        # Пропускаем дни где нет свободного времени
+        free = get_blocked_slots(year, month, day, new_duration_slots=new_duration_slots)
+        all_slots = set(TIME_SLOTS)
+        if all_slots <= free:  # все слоты заняты
             continue
         row.append(InlineKeyboardButton(text=str(day), callback_data=f"day:{day}"))
         if len(row) == 7:
             rows.append(row); row = []
     if row:
         rows.append(row)
+    if not rows:
+        rows.append([InlineKeyboardButton(text="Нет доступных дней", callback_data="noop")])
     rows.append([
         InlineKeyboardButton(text="◀️ Назад",        callback_data="back_to_months"),
         InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"),
@@ -220,20 +413,19 @@ def days_kb(month: int):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def time_kb(month: int, day: int, exclude_bid: int | None = None):
-    blocked = get_blocked_slots(month, day, exclude_bid)
+def time_kb(year: int, month: int, day: int, exclude_bid: int | None = None,
+            new_duration_slots: int = 1) -> InlineKeyboardMarkup:
+    blocked = get_blocked_slots(year, month, day, exclude_bid, new_duration_slots)
     rows, row = [], []
     for slot in TIME_SLOTS:
-        if slot in blocked:
-            # Показываем занятый слот серым крестиком (нельзя нажать — disabled через текст)
-            row.append(InlineKeyboardButton(text=f"❌ {slot}", callback_data="slot_busy"))
-        else:
-            cb = "t_" + slot.replace(":", "")
-            row.append(InlineKeyboardButton(text=slot, callback_data=cb))
-        if len(row) == 3:
-            rows.append(row); row = []
+        if slot not in blocked:
+            row.append(InlineKeyboardButton(text=slot, callback_data="t_" + slot.replace(":", "")))
+            if len(row) == 3:
+                rows.append(row); row = []
     if row:
         rows.append(row)
+    if not rows:
+        rows.append([InlineKeyboardButton(text="Нет свободного времени", callback_data="noop")])
     rows.append([
         InlineKeyboardButton(text="◀️ Назад",        callback_data="back_to_days"),
         InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"),
@@ -247,40 +439,37 @@ def back_to_menu_kb():
     ])
 
 
-def booking_list_kb(user_id: int):
-    user_bookings = bookings.get(user_id, [])
+def booking_list_kb(user_id: int) -> InlineKeyboardMarkup:
+    user_bookings = get_user_bookings(user_id)
     rows = []
-    for i, b in enumerate(user_bookings, 1):
-        month_name = MONTHS[b["month"]]
-        label = f"#{i} — {b['service'][:18]} | {b['day']} {month_name} {b['time']}"
+    for b in user_bookings:
+        label = f"💅 {b['service'][:20]}  {b['day']} {MONTHS[b['month']]} {b['time']}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"viewb:{b['id']}")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def booking_actions_kb(bid: int):
+def booking_actions_kb(bid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_booking:{bid}"),
             InlineKeyboardButton(text="🗑 Удалить",        callback_data=f"del_booking:{bid}"),
         ],
         [
-            InlineKeyboardButton(text="◀️ Все брони",     callback_data="my_booking"),
-            InlineKeyboardButton(text="🏠 Главное меню",  callback_data="main_menu"),
+            InlineKeyboardButton(text="◀️ Все брони",    callback_data="my_booking"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"),
         ],
     ])
 
 
-def confirm_delete_kb(bid: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_del:{bid}"),
-            InlineKeyboardButton(text="❌ Отмена",       callback_data=f"viewb:{bid}"),
-        ]
-    ])
+def confirm_delete_kb(bid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_del:{bid}"),
+        InlineKeyboardButton(text="❌ Отмена",       callback_data=f"viewb:{bid}"),
+    ]])
 
 
-def edit_options_kb(bid: int):
+def edit_options_kb(bid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💅 Изменить услугу",  callback_data=f"efield:service:{bid}")],
         [InlineKeyboardButton(text="📅 Изменить дату",    callback_data=f"efield:date:{bid}")],
@@ -291,162 +480,230 @@ def edit_options_kb(bid: int):
     ])
 
 
-def services_edit_kb(bid: int):
-    rows = [
-        [InlineKeyboardButton(text=f"{s['name']} — {s['price']}", callback_data=f"esvc:{bid}:{s['name']}")]
-        for s in services
-    ]
+def services_edit_kb(bid: int) -> InlineKeyboardMarkup:
+    rows = []
+    for s in services:
+        label = f"{s['name']} — {s['price']} ({s['duration']})"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"esvc:{bid}:{s['name']}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"edit_booking:{bid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ─── Панель админа ───────────────────────────────────────────────────────────
-
-def admin_panel_kb():
+def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Все брони",         callback_data="admin_all")],
-        [InlineKeyboardButton(text="📅 Брони на сегодня",  callback_data="admin_today")],
-        [InlineKeyboardButton(text="🔜 Брони на завтра",   callback_data="admin_tomorrow")],
+        [InlineKeyboardButton(text="📋 Все брони",        callback_data="admin_all")],
+        [InlineKeyboardButton(text="📅 Брони на сегодня", callback_data="admin_today")],
+        [InlineKeyboardButton(text="🔜 Брони на завтра",  callback_data="admin_tomorrow")],
+        [InlineKeyboardButton(text="🗓 Моё расписание",   callback_data="admin_schedule")],
     ])
 
 
-def admin_booking_kb(bid: int, user_id: int):
+def schedule_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Отменить бронь", callback_data=f"admin_del:{bid}:{user_id}")],
-        [InlineKeyboardButton(text="◀️ Назад",          callback_data="admin_all")],
+        [InlineKeyboardButton(text="🚫 Заблокировать день",   callback_data="sched_block_day")],
+        [InlineKeyboardButton(text="✅ Разблокировать день",  callback_data="sched_unblock_day")],
+        [InlineKeyboardButton(text="🚫 Заблокировать часы",   callback_data="sched_block_slots")],
+        [InlineKeyboardButton(text="✅ Разблокировать часы",  callback_data="sched_unblock_slots")],
+        [InlineKeyboardButton(text="📋 Показать расписание",  callback_data="sched_show")],
+        [InlineKeyboardButton(text="◀️ Назад",                callback_data="admin_back")],
     ])
 
 
-# ─── Старт ───────────────────────────────────────────────────────────────────
+def schedule_months_kb(action: str) -> InlineKeyboardMarkup:
+    now = datetime.now()
+    rows, row = [], []
+    shown = 0
+    for num, name in MONTHS.items():
+        if num < now.month:
+            continue
+        if shown >= 3:
+            break
+        row.append(InlineKeyboardButton(text=name, callback_data=f"sm_{action}:{num}"))
+        shown += 1
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_schedule")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def schedule_days_kb(month: int, action: str) -> InlineKeyboardMarkup:
+    now = datetime.now()
+    _, days_in_month = calendar.monthrange(now.year, month)
+    rows, row = [], []
+    for day in range(1, days_in_month + 1):
+        if month == now.month and day < now.day:
+            continue
+        key   = date_key(now.year, month, day)
+        label = f"🚫{day}" if key in get_blocked_days() else str(day)
+        row.append(InlineKeyboardButton(text=label, callback_data=f"sd_{action}:{month}:{day}"))
+        if len(row) == 7:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_schedule")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def schedule_slots_kb(month: int, day: int, action: str) -> InlineKeyboardMarkup:
+    year           = datetime.now().year
+    key            = date_key(year, month, day)
+    blocked_manual = get_blocked_slots_for_date(key)
+    # Слоты занятые клиентами
+    booked_slots = set()
+    for b in get_all_bookings():
+        if b["year"] == year and b["month"] == month and b["day"] == day:
+            svc = get_service(b["service"])
+            dur = svc["duration_slots"] if svc else 1
+            bi  = TIME_SLOTS.index(b["time"])
+            for i in range(dur):
+                idx = bi + i
+                if 0 <= idx < len(TIME_SLOTS):
+                    booked_slots.add(TIME_SLOTS[idx])
+    rows, row = [], []
+    for slot in TIME_SLOTS:
+        if slot in blocked_manual:
+            label = f"🔒{slot}"
+        elif slot in booked_slots:
+            label = f"👤{slot}"
+        else:
+            label = slot
+        row.append(InlineKeyboardButton(
+            text=label,
+            callback_data=f"ss_{action}:{month}:{day}:{slot.replace(':', '')}"
+        ))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_schedule")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ─── /start ───────────────────────────────────────────────────────────────────
 
 @dp.message(Command(commands=["start"]))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    is_admin = message.from_user.id == ADMIN_ID
+    is_admin = message.from_user.id in ADMIN_IDS
     photo = FSInputFile("images/darja.png")
     await message.answer_photo(
         photo=photo,
-        caption="💅 *Добро пожаловать!*\n\nЯ — Дарья, мастер маникюра и педикюра.",
-        parse_mode="Markdown",
+        caption=(
+            "👋 Привет! Я помощник по записи\n"
+            "к мастеру маникюра Дарье 💅"
+        ),
+        reply_markup=bottom_kb(is_admin)
     )
-    await message.answer("Выберите услугу 👇", reply_markup=bottom_kb(is_admin))
-    await message.answer("Список услуг:", reply_markup=main_menu_kb())
+    await message.answer("💅 Выберите услугу:", reply_markup=main_menu_kb())
 
 
-# ─── Нижняя кнопка «Услуги» ──────────────────────────────────────────────────
+# ─── Нижние кнопки ────────────────────────────────────────────────────────────
 
 @dp.message(F.text == "💅 Услуги")
 async def btn_services(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Выберите услугу:", reply_markup=main_menu_kb())
+    await message.answer("Выберите услугу 👇", reply_markup=main_menu_kb())
 
-
-# ─── Нижняя кнопка «Мои брони» ───────────────────────────────────────────────
 
 @dp.message(F.text == "📋 Мои брони")
 async def btn_my_bookings(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    user_bookings = bookings.get(user_id, [])
+    user_id       = message.from_user.id
+    user_bookings = get_user_bookings(user_id)
     if not user_bookings:
         await message.answer("У вас нет активных броней.")
         return
-    await message.answer(
-        f"📋 *Ваши брони* ({len(user_bookings)} шт.):",
-        parse_mode="Markdown",
-        reply_markup=booking_list_kb(user_id)
-    )
+    await message.answer("📋 Ваши брони:", reply_markup=booking_list_kb(user_id))
 
 
-# ─── Нижняя кнопка «Панель админа» ───────────────────────────────────────────
+@dp.message(F.text == "📞 Контакты")
+async def btn_contacts(message: types.Message):
+    await message.answer("📇 Контакты мастера:\n\n" + CONTACTS_FULL)
+
 
 @dp.message(F.text == "🔐 Админка")
 async def btn_admin_panel(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         await message.answer("⛔️ Нет доступа.")
         return
     all_b = get_all_bookings()
     await message.answer(
-        f"🔐 *Панель администратора*\nВсего броней: {len(all_b)}",
-        parse_mode="Markdown",
+        f"🔐 Панель администратора\nВсего броней: {len(all_b)}",
         reply_markup=admin_panel_kb()
     )
 
 
-# ─── Инлайн: главное меню ────────────────────────────────────────────────────
+# ─── Инлайн: меню ─────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "main_menu")
 async def go_main_menu(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.answer("Выберите услугу:", reply_markup=main_menu_kb())
+    await call.message.answer("Выберите услугу 👇", reply_markup=main_menu_kb())
     await call.answer()
 
 
-# ─── Инлайн: мои брони ───────────────────────────────────────────────────────
+@dp.callback_query(F.data == "day_blocked")
+async def day_blocked_cb(call: types.CallbackQuery):
+    await call.answer("🚫 Этот день недоступен для записи.", show_alert=True)
+
+
+@dp.callback_query(F.data == "slot_busy")
+async def slot_busy(call: types.CallbackQuery):
+    await call.answer("❌ Это время недоступно.", show_alert=True)
+
+
+# ─── Инлайн: мои брони ────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "my_booking")
 async def show_my_bookings(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    user_id = call.from_user.id
-    user_bookings = bookings.get(user_id, [])
+    user_id       = call.from_user.id
+    user_bookings = get_user_bookings(user_id)
     if not user_bookings:
         await call.answer("У вас нет активных броней.", show_alert=True)
         return
-    await call.message.answer(
-        f"📋 *Ваши брони* ({len(user_bookings)} шт.):",
-        parse_mode="Markdown",
-        reply_markup=booking_list_kb(user_id)
-    )
+    await call.message.answer("📋 Ваши брони:", reply_markup=booking_list_kb(user_id))
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("viewb:"))
 async def view_booking(call: types.CallbackQuery):
-    user_id = call.from_user.id
     bid = int(call.data.split(":")[1])
-    b = get_booking(user_id, bid)
-    if not b:
+    b   = get_booking(bid)
+    if not b or b["user_id"] != call.from_user.id:
         await call.answer("Бронь не найдена.", show_alert=True)
         return
-    user_bookings = bookings.get(user_id, [])
+    user_bookings = get_user_bookings(call.from_user.id)
     idx = next((i + 1 for i, x in enumerate(user_bookings) if x["id"] == bid), 1)
-    await call.message.answer(
-        f"📋 {format_booking(b, idx)}",
-        parse_mode="Markdown",
-        reply_markup=booking_actions_kb(bid)
-    )
+    await call.message.answer(format_booking(b, idx), reply_markup=booking_actions_kb(bid))
     await call.answer()
 
 
-# ─── Занятый слот ────────────────────────────────────────────────────────────
-
-@dp.callback_query(F.data == "slot_busy")
-async def slot_busy(call: types.CallbackQuery):
-    await call.answer("❌ Это время занято. Мастер будет занят 2 часа.", show_alert=True)
-
-
-# ─── Удаление брони (клиент) ─────────────────────────────────────────────────
+# ─── Удаление брони ───────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("del_booking:"))
 async def delete_booking_confirm(call: types.CallbackQuery):
     bid = int(call.data.split(":")[1])
-    await call.message.answer("❗️ Вы уверены, что хотите удалить эту бронь?", reply_markup=confirm_delete_kb(bid))
+    await call.message.answer("❗️ Вы уверены, что хотите удалить эту бронь?",
+                               reply_markup=confirm_delete_kb(bid))
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("confirm_del:"))
 async def confirm_delete(call: types.CallbackQuery):
-    user_id = call.from_user.id
     bid = int(call.data.split(":")[1])
-    b = get_booking(user_id, bid)
-    if b and user_id in bookings:
-        remove_booking(user_id, bid)
-        await bot.send_message(ADMIN_ID, f"🗑 *Клиент отменил бронь!*\n\n{format_booking(b)}", parse_mode="Markdown")
+    b   = get_booking(bid)
+    if b and b["user_id"] == call.from_user.id:
+        remove_booking(bid)
+        for _aid in ADMIN_IDS:
+            await bot.send_message(_aid, f"🗑 Клиент отменил бронь!\n\n{format_booking(b)}")
     await call.message.answer("✅ Бронь удалена.", reply_markup=back_to_menu_kb())
     await call.answer()
 
 
-# ─── Редактирование брони ────────────────────────────────────────────────────
+# ─── Редактирование брони ─────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("edit_booking:"))
 async def edit_booking_menu(call: types.CallbackQuery):
@@ -457,7 +714,7 @@ async def edit_booking_menu(call: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("efield:"))
 async def edit_field_start(call: types.CallbackQuery, state: FSMContext):
-    parts = call.data.split(":", 2)
+    parts      = call.data.split(":", 2)
     field, bid = parts[1], int(parts[2])
     await state.update_data(edit_bid=bid)
 
@@ -465,17 +722,13 @@ async def edit_field_start(call: types.CallbackQuery, state: FSMContext):
         await call.message.answer("Выберите новую услугу:", reply_markup=services_edit_kb(bid))
         await state.set_state(EditBooking.service)
     elif field == "date":
-        await call.message.answer("Выберите новый месяц:", reply_markup=months_kb())
-        await state.set_state(EditBooking.month)
+        await call.message.answer("Выберите год:", reply_markup=years_kb())
+        await state.set_state(EditBooking.year)
     elif field == "time":
-        user_id = call.from_user.id
-        b = get_booking(user_id, bid)
+        b = get_booking(bid)
         if b:
-            await call.message.answer(
-                "Выберите новое время:\n_(❌ — занято)_",
-                parse_mode="Markdown",
-                reply_markup=time_kb(b["month"], b["day"], exclude_bid=bid)
-            )
+            await call.message.answer("Выберите новое время:",
+                                      reply_markup=time_kb(b["year"], b["month"], b["day"], exclude_bid=bid))
         await state.set_state(EditBooking.time)
     elif field == "name":
         await call.message.answer("Введите новое имя:")
@@ -486,270 +739,173 @@ async def edit_field_start(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-async def notify_edit(user_id: int, bid: int):
-    b = get_booking(user_id, bid)
+async def notify_edit(bid: int):
+    b = get_booking(bid)
     if not b:
         return
-    save_bookings()  # Сохраняем изменения на диск
-    user_bookings = bookings.get(user_id, [])
+    user_bookings = get_user_bookings(b["user_id"])
     idx = next((i + 1 for i, x in enumerate(user_bookings) if x["id"] == bid), 1)
-    await bot.send_message(
-        user_id,
-        f"✅ *Ваша бронь обновлена!*\n\n{format_booking(b, idx)}",
-        parse_mode="Markdown",
-        reply_markup=booking_actions_kb(bid)
-    )
-    await bot.send_message(
-        ADMIN_ID,
-        f"✏️ *Клиент изменил бронь!*\n\n{format_booking(b)}",
-        parse_mode="Markdown"
-    )
+    await bot.send_message(b["user_id"],
+                           f"✅ Ваша бронь обновлена!\n\n{format_booking(b, idx)}",
+                           reply_markup=booking_actions_kb(bid))
+    for _aid in ADMIN_IDS:
+        await bot.send_message(_aid, f"✏️ Клиент изменил бронь!\n\n{format_booking(b)}")
 
 
 @dp.callback_query(F.data.startswith("esvc:"), EditBooking.service)
 async def edit_service_save(call: types.CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
     _, bid_str, service_name = call.data.split(":", 2)
     bid = int(bid_str)
-    b = get_booking(user_id, bid)
-    if b:
-        b["service"] = service_name
+    update_booking_field(bid, "service", service_name)
     await state.clear()
-    await notify_edit(user_id, bid)
+    await notify_edit(bid)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("year:"), EditBooking.year)
+async def edit_year_save(call: types.CallbackQuery, state: FSMContext):
+    year = int(call.data.split(":")[1])
+    await state.update_data(edit_year=year)
+    await call.message.answer(f"Выберите месяц ({year}):", reply_markup=months_kb(year))
+    await state.set_state(EditBooking.month)
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("month:"), EditBooking.month)
 async def edit_month_save(call: types.CallbackQuery, state: FSMContext):
     month = int(call.data.split(":")[1])
+    data  = await state.get_data()
+    year  = data.get("edit_year", datetime.now().year)
     await state.update_data(edit_month=month)
-    await call.message.answer(f"Выберите день ({MONTHS[month]}):", reply_markup=days_kb(month))
+    await call.message.answer(f"Выберите день:", reply_markup=days_kb(year, month))
     await state.set_state(EditBooking.day)
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("day:"), EditBooking.day)
 async def edit_day_save(call: types.CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
-    day = int(call.data.split(":")[1])
+    day  = int(call.data.split(":")[1])
     data = await state.get_data()
-    bid = data["edit_bid"]
+    bid  = data["edit_bid"]
+    year  = data.get("edit_year", datetime.now().year)
     month = data.get("edit_month")
-    b = get_booking(user_id, bid)
-    if b and month:
-        b["month"] = month
-        b["day"] = day
+    if month:
+        update_booking_field(bid, "year",  year)
+        update_booking_field(bid, "month", month)
+        update_booking_field(bid, "day",   day)
     await state.clear()
-    await notify_edit(user_id, bid)
+    await notify_edit(bid)
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("t_"), EditBooking.time)
 async def edit_time_save(call: types.CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
-    raw = call.data[2:]
+    raw      = call.data[2:]
     time_str = raw[:2] + ":" + raw[2:]
-    data = await state.get_data()
-    bid = data["edit_bid"]
-    b = get_booking(user_id, bid)
-    if b:
-        b["time"] = time_str
+    data     = await state.get_data()
+    bid      = data["edit_bid"]
+    update_booking_field(bid, "time", time_str)
     await state.clear()
-    await notify_edit(user_id, bid)
+    await notify_edit(bid)
     await call.answer()
 
 
 @dp.message(EditBooking.name)
 async def edit_name_save(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
     data = await state.get_data()
-    bid = data["edit_bid"]
-    b = get_booking(user_id, bid)
-    if b:
-        b["name"] = message.text
+    bid  = data["edit_bid"]
+    update_booking_field(bid, "name", message.text)
     await state.clear()
-    await notify_edit(user_id, bid)
+    await notify_edit(bid)
 
 
 @dp.message(EditBooking.phone)
 async def edit_phone_save(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
     data = await state.get_data()
-    bid = data["edit_bid"]
-    b = get_booking(user_id, bid)
-    if b:
-        b["phone"] = message.text
+    bid  = data["edit_bid"]
+    update_booking_field(bid, "phone", message.text)
     await state.clear()
-    await notify_edit(user_id, bid)
+    await notify_edit(bid)
 
 
-# ─── Панель админа (инлайн) ──────────────────────────────────────────────────
-
-@dp.callback_query(F.data.startswith("admin_"))
-async def admin_actions(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("⛔️ Нет доступа.", show_alert=True)
-        return
-
-    action = call.data
-
-    if action == "admin_all":
-        all_b = get_all_bookings()
-        if not all_b:
-            await call.message.answer("Броней пока нет.")
-            await call.answer()
-            return
-        # Показываем по 10 броней
-        text = f"📋 *Все брони ({len(all_b)} шт.):*\n\n"
-        rows = []
-        for i, b in enumerate(all_b, 1):
-            month_name = MONTHS[b["month"]]
-            text += (
-                f"*#{i}* | {b['day']} {month_name} {b['time']}\n"
-                f"💅 {b['service']}\n"
-                f"👤 {b['name']} | 📞 {b['phone']}\n\n"
-            )
-            rows.append([InlineKeyboardButton(
-                text=f"🗑 Отменить #{i} — {b['name']} {b['day']} {month_name}",
-                callback_data=f"admin_del:{b['id']}:{b['user_id']}"
-            )])
-        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
-        await call.message.answer(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-    elif action == "admin_today":
-        now = datetime.now()
-        today_b = [b for b in get_all_bookings() if b["month"] == now.month and b["day"] == now.day]
-        if not today_b:
-            await call.message.answer("Сегодня броней нет.")
-        else:
-            text = f"📅 *Брони на сегодня ({now.day} {MONTHS[now.month]}):*\n\n"
-            rows = []
-            for i, b in enumerate(today_b, 1):
-                text += f"*{b['time']}* | 💅 {b['service']}\n👤 {b['name']} | 📞 {b['phone']}\n\n"
-                rows.append([InlineKeyboardButton(
-                    text=f"🗑 Отменить {b['time']} — {b['name']}",
-                    callback_data=f"admin_del:{b['id']}:{b['user_id']}"
-                )])
-            rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
-            await call.message.answer(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-    elif action == "admin_tomorrow":
-        now = datetime.now()
-        _, days_in_month = calendar.monthrange(now.year, now.month)
-        if now.day < days_in_month:
-            tom_day, tom_month = now.day + 1, now.month
-        else:
-            tom_day, tom_month = 1, now.month + 1 if now.month < 12 else 1
-        tom_b = [b for b in get_all_bookings() if b["month"] == tom_month and b["day"] == tom_day]
-        if not tom_b:
-            await call.message.answer("Завтра броней нет.")
-        else:
-            text = f"🔜 *Брони на завтра ({tom_day} {MONTHS[tom_month]}):*\n\n"
-            rows = []
-            for i, b in enumerate(tom_b, 1):
-                text += f"*{b['time']}* | 💅 {b['service']}\n👤 {b['name']} | 📞 {b['phone']}\n\n"
-                rows.append([InlineKeyboardButton(
-                    text=f"🗑 Отменить {b['time']} — {b['name']}",
-                    callback_data=f"admin_del:{b['id']}:{b['user_id']}"
-                )])
-            rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
-            await call.message.answer(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-    elif action == "admin_back":
-        all_b = get_all_bookings()
-        await call.message.answer(
-            f"🔐 *Панель администратора*\nВсего броней: {len(all_b)}",
-            parse_mode="Markdown",
-            reply_markup=admin_panel_kb()
-        )
-
-    elif action.startswith("admin_del:"):
-        parts = action.split(":")
-        bid, uid = int(parts[1]), int(parts[2])
-        b = get_booking(uid, bid)
-        if b and uid in bookings:
-            remove_booking(uid, bid)
-            # Уведомляем клиента
-            try:
-                await bot.send_message(
-                    uid,
-                    f"❌ *Ваша бронь была отменена мастером.*\n\n{format_booking(b)}",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-            await call.message.answer(f"✅ Бронь #{bid} отменена.")
-        else:
-            await call.message.answer("Бронь не найдена.")
-
-    await call.answer()
-
-
-# ─── Новая бронь ─────────────────────────────────────────────────────────────
+# ─── Новая бронь ──────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("svc:"))
 async def service_choice(call: types.CallbackQuery, state: FSMContext):
     service_name = call.data[4:]
-    service = next(s for s in services if s["name"] == service_name)
-    await state.update_data(service=service_name)
-    photo = FSInputFile(service["img"])
+    svc          = get_service(service_name)
+    if not svc:
+        await call.answer("Услуга не найдена.", show_alert=True)
+        return
+    year = datetime.now().year
+    await state.update_data(service=service_name, year=year)
+    photo = FSInputFile(svc["img"])
     await call.message.answer_photo(
         photo=photo,
-        caption=f"✅ Вы выбрали: *{service_name}*\n\nВыберите месяц:",
-        parse_mode="Markdown",
-        reply_markup=months_kb()
+        caption=(f"✅ Вы выбрали: {service_name}\n"
+                 f"💰 {svc['price']} | ⏱ {svc['duration']}\n\nВыберите месяц:"),
+        reply_markup=months_kb(year)
     )
     await state.set_state(Booking.month)
     await call.answer()
 
 
+
+
 @dp.callback_query(F.data == "back_to_months")
 async def back_to_months(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("Выберите месяц:", reply_markup=months_kb())
-    await state.set_state(Booking.month)
-    await call.answer()
-
-
-@dp.callback_query(F.data == "back_to_days")
-async def back_to_days(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    month = data.get("month")
-    if month:
-        await call.message.answer(f"Выберите день ({MONTHS[month]}):", reply_markup=days_kb(month))
-        await state.set_state(Booking.day)
-    else:
-        await call.message.answer("Выберите месяц:", reply_markup=months_kb())
-        await state.set_state(Booking.month)
+    year = data.get("year", datetime.now().year)
+    await call.message.answer("Выберите месяц:", reply_markup=months_kb(year))
+    await state.set_state(Booking.month)
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("month:"), Booking.month)
 async def month_choice(call: types.CallbackQuery, state: FSMContext):
     month = int(call.data.split(":")[1])
+    data  = await state.get_data()
+    year  = data.get("year", datetime.now().year)
     await state.update_data(month=month)
-    await call.message.answer(f"Выберите день ({MONTHS[month]}):", reply_markup=days_kb(month))
+    svc_d = get_service(data.get("service",""))
+    dur_d = svc_d["duration_slots"] if svc_d else 1
+    await call.message.answer(f"Выберите день ({MONTHS[month]}):", reply_markup=days_kb(year, month, dur_d))
     await state.set_state(Booking.day)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "back_to_days")
+async def back_to_days(call: types.CallbackQuery, state: FSMContext):
+    data  = await state.get_data()
+    year  = data.get("year", datetime.now().year)
+    month = data.get("month")
+    if month:
+        await call.message.answer(f"Выберите день ({MONTHS[month]}):", reply_markup=days_kb(year, month))
+        await state.set_state(Booking.day)
+    else:
+        await call.message.answer("Выберите месяц:", reply_markup=months_kb(year))
+        await state.set_state(Booking.month)
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("day:"), Booking.day)
 async def day_choice(call: types.CallbackQuery, state: FSMContext):
-    day = int(call.data.split(":")[1])
+    day  = int(call.data.split(":")[1])
     data = await state.get_data()
+    year  = data.get("year", datetime.now().year)
     month = data.get("month")
     await state.update_data(day=day)
-    await call.message.answer(
-        "Выберите удобное время:\n_(❌ — занято)_",
-        parse_mode="Markdown",
-        reply_markup=time_kb(month, day)
-    )
+    svc_data = get_service(data.get("service", ""))
+    new_dur  = svc_data["duration_slots"] if svc_data else 1
+    await call.message.answer("Выберите удобное время:",
+                               reply_markup=time_kb(year, month, day, new_duration_slots=new_dur))
     await state.set_state(Booking.time)
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("t_"), Booking.time)
 async def time_choice(call: types.CallbackQuery, state: FSMContext):
-    raw = call.data[2:]
+    raw      = call.data[2:]
     time_str = raw[:2] + ":" + raw[2:]
     await state.update_data(time=time_str)
     await call.message.answer("Введите ваше имя:")
@@ -766,41 +922,363 @@ async def enter_name(message: types.Message, state: FSMContext):
 
 @dp.message(Booking.phone)
 async def enter_phone(message: types.Message, state: FSMContext):
-    data = await state.get_data()
+    data    = await state.get_data()
     user_id = message.from_user.id
 
-    bid = next_booking_id()
-    new_booking = {
-        "id":      bid,
-        "service": data["service"],
-        "month":   data["month"],
-        "day":     data["day"],
-        "time":    data["time"],
-        "name":    data["name"],
-        "phone":   message.text,
-    }
-    add_booking(user_id, new_booking)
+    # Финальная проверка на сервере — слот ещё свободен?
+    svc_chk  = get_service(data.get("service", ""))
+    dur_chk  = svc_chk["duration_slots"] if svc_chk else 1
+    yr  = data.get("year") or datetime.now().year
+    mon = data.get("month")
+    day = data.get("day")
+    busy_idx = get_busy_indices(yr, mon, day)
+    blocked_now = get_blocked_slots(yr, mon, day, new_duration_slots=dur_chk)
+    print(f"[DEBUG] Бронь: {data.get('service')} dur={dur_chk} слота, {yr}-{mon:02d}-{day:02d} {data.get('time')}")
+    print(f"[DEBUG] Занятые индексы: {busy_idx}, заблок: {sorted(blocked_now)}")
+    for _b in get_all_bookings():
+        if _b['year']==yr and _b['month']==mon and _b['day']==day:
+            print(f"[DEBUG] В БД: id={_b['id']} {_b['time']} {_b['service']}")
+    if data["time"] in blocked_now:
+        await message.answer(
+            "⚠️ Это время уже заняли пока вы оформляли запись.\n"
+            "Пожалуйста, начните запись заново 👇",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+        return
 
-    month_name = MONTHS[data["month"]]
+    bid = add_booking(
+        user_id=user_id,
+        service=data["service"],
+        year=yr,
+        month=mon,
+        day=day,
+        time=data["time"],
+        name=data["name"],
+        phone=message.text,
+    )
+    b = get_booking(bid)
+
+    svc      = get_service(data["service"])
+    dur      = svc["duration"] if svc else ""
+    end_time = get_end_time(data["time"], duration_minutes(svc))
+
     await message.answer(
-        f"✅ *Бронь подтверждена!*\n\n{format_booking(new_booking)}",
-        parse_mode="Markdown",
+        f"✅ Бронь подтверждена!\n\n"
+        f"{format_booking(b)}\n\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"📍 Контакты мастера:\n{CONTACTS_SHORT}",
         reply_markup=back_to_menu_kb()
     )
-    await bot.send_message(
-        ADMIN_ID,
-        f"🔔 *Новая бронь!*\n\n"
-        f"💅 Услуга: {data['service']}\n"
-        f"📅 Дата: {data['day']} {month_name}\n"
-        f"🕐 Время: {data['time']}\n"
-        f"👤 Имя: {data['name']}\n"
-        f"📞 Телефон: {message.text}",
-        parse_mode="Markdown"
-    )
+    for _aid in ADMIN_IDS:
+        await bot.send_message(
+            _aid,
+            f"🔔 Новая бронь!\n\n"
+            f"💅 {data['service']} ({dur})\n"
+            f"📅 {data['day']} {MONTHS[data['month']]} {data['year']}\n"
+            f"🕐 {data['time']}—{end_time}\n"
+            f"👤 {data['name']}\n"
+            f"📞 {message.text}"
+        )
     await state.clear()
 
 
+# ─── Панель администратора ────────────────────────────────────────────────────
+
+
+@dp.callback_query(F.data.startswith("admin_view:"))
+async def admin_view_booking(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("⛔️ Нет доступа.", show_alert=True); return
+    bid = int(call.data.split(":")[1])
+    b   = get_booking(bid)
+    if not b:
+        await call.answer("Бронь не найдена.", show_alert=True); return
+    svc      = get_service(b["service"])
+    dur      = svc["duration"] if svc else ""
+    end_time = get_end_time(b["time"], duration_minutes(svc))
+    text = (
+        f"📋 Бронь #{bid}\n\n"
+        f"💅 {b['service']} ({dur})\n"
+        f"📅 {b['day']} {MONTHS[b['month']]} {b['year']}\n"
+        f"🕐 {b['time']} — {end_time}\n"
+        f"👤 {b['name']}\n"
+        f"📞 {b['phone']}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_booking:{bid}"),
+         InlineKeyboardButton(text="🗑 Удалить",        callback_data=f"admin_del:{bid}")],
+        [InlineKeyboardButton(text="◀️ Назад",          callback_data="admin_all")],
+    ])
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("admin_"))
+async def admin_actions(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("⛔️ Нет доступа.", show_alert=True)
+        return
+    action = call.data
+
+    if action == "admin_all":
+        all_b = get_all_bookings()
+        if not all_b:
+            await call.message.answer("Броней пока нет.")
+            await call.answer(); return
+        text = f"📋 Все брони ({len(all_b)} шт.):\n\n"
+        rows = []
+        for i, b in enumerate(all_b, 1):
+            svc      = get_service(b["service"])
+            dur      = svc["duration"] if svc else ""
+            end_time = get_end_time(b["time"], duration_minutes(svc))
+            text += (f"#{i} | {b['day']} {MONTHS[b['month']]} {b['year']} {b['time']}—{end_time}\n"
+                     f"💅 {b['service']} ({dur})\n"
+                     f"👤 {b['name']} | 📞 {b['phone']}\n\n")
+            rows.append([InlineKeyboardButton(
+                text=f"👁 #{i} — {b['name']} | {b['day']} {MONTHS[b['month']]} {b['time']}",
+                callback_data=f"admin_view:{b['id']}"
+            )])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    elif action == "admin_today":
+        now     = datetime.now()
+        today_b = [b for b in get_all_bookings()
+                   if b["year"] == now.year and b["month"] == now.month and b["day"] == now.day]
+        if not today_b:
+            await call.message.answer("Сегодня броней нет.")
+        else:
+            text = f"📅 Сегодня ({now.day} {MONTHS[now.month]} {now.year}):\n\n"
+            rows = []
+            for b in today_b:
+                svc      = get_service(b["service"])
+                dur      = svc["duration"] if svc else ""
+                end_time = get_end_time(b["time"], duration_minutes(svc))
+                text += (f"🕐 {b['time']}—{end_time} | {b['service']} ({dur})\n"
+                         f"👤 {b['name']} | 📞 {b['phone']}\n\n")
+                rows.append([InlineKeyboardButton(
+                    text=f"👁 {b['time']} — {b['name']}",
+                    callback_data=f"admin_view:{b['id']}"
+                )])
+            rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+            await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    elif action == "admin_tomorrow":
+        tomorrow = datetime.now() + timedelta(days=1)
+        tom_b = [b for b in get_all_bookings()
+                 if b["year"] == tomorrow.year and b["month"] == tomorrow.month and b["day"] == tomorrow.day]
+        if not tom_b:
+            await call.message.answer("Завтра броней нет.")
+        else:
+            text = f"🔜 Завтра ({tomorrow.day} {MONTHS[tomorrow.month]} {tomorrow.year}):\n\n"
+            rows = []
+            for b in tom_b:
+                svc      = get_service(b["service"])
+                dur      = svc["duration"] if svc else ""
+                end_time = get_end_time(b["time"], duration_minutes(svc))
+                text += (f"🕐 {b['time']}—{end_time} | {b['service']} ({dur})\n"
+                         f"👤 {b['name']} | 📞 {b['phone']}\n\n")
+                rows.append([InlineKeyboardButton(
+                    text=f"👁 {b['time']} — {b['name']}",
+                    callback_data=f"admin_view:{b['id']}"
+                )])
+            rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+            await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    elif action == "admin_schedule":
+        await call.message.answer("🗓 Управление расписанием\n\nЧто хотите сделать?",
+                                  reply_markup=schedule_main_kb())
+
+    elif action == "admin_back":
+        all_b = get_all_bookings()
+        await call.message.answer(f"🔐 Панель администратора\nВсего броней: {len(all_b)}",
+                                  reply_markup=admin_panel_kb())
+
+    elif action.startswith("admin_del:"):
+        bid = int(action.split(":")[1])
+        b   = get_booking(bid)
+        if b:
+            remove_booking(bid)
+            try:
+                await bot.send_message(b["user_id"],
+                    f"❌ Ваша бронь была отменена мастером.\n\n{format_booking(b)}")
+            except Exception:
+                pass
+            await call.message.answer("✅ Бронь отменена.")
+        else:
+            await call.message.answer("Бронь не найдена.")
+
+    await call.answer()
+
+
+# ─── Расписание ───────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("sched_"))
+async def schedule_actions(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("⛔️ Нет доступа.", show_alert=True)
+        return
+    action = call.data
+    if action == "sched_block_day":
+        await call.message.answer("Выберите месяц:", reply_markup=schedule_months_kb("bday"))
+    elif action == "sched_unblock_day":
+        await call.message.answer("Выберите месяц:", reply_markup=schedule_months_kb("uday"))
+    elif action == "sched_block_slots":
+        await call.message.answer("Выберите месяц:", reply_markup=schedule_months_kb("bslot"))
+    elif action == "sched_unblock_slots":
+        await call.message.answer("Выберите месяц:", reply_markup=schedule_months_kb("uslot"))
+    elif action == "sched_show":
+        blocked = get_blocked_days()
+        slots   = get_all_blocked_slots()
+        text    = "📋 Текущие ограничения:\n\n"
+        if blocked:
+            text += "Заблокированные дни:\n"
+            for d in sorted(blocked):
+                text += f"  🚫 {d}\n"
+            text += "\n"
+        if slots:
+            text += "Заблокированные часы:\n"
+            for d, sl in sorted(slots.items()):
+                text += f"  📅 {d}: {', '.join(sl)}\n"
+        if not blocked and not slots:
+            text += "Ограничений нет — все дни и часы открыты."
+        await call.message.answer(text, reply_markup=schedule_main_kb())
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("sm_"))
+async def schedule_month_pick(call: types.CallbackQuery):
+    _, rest  = call.data.split("_", 1)
+    act, mon = rest.split(":")
+    await call.message.answer(f"Выберите день ({MONTHS[int(mon)]}):",
+                               reply_markup=schedule_days_kb(int(mon), act))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("sd_"))
+async def schedule_day_pick(call: types.CallbackQuery):
+    _, rest       = call.data.split("_", 1)
+    act, mon, day = rest.split(":")
+    month, day    = int(mon), int(day)
+    key           = date_key(datetime.now().year, month, day)
+
+    if act == "bday":
+        block_day(key)
+        await call.answer(f"🚫 День {day} {MONTHS[month]} заблокирован")
+        # Обновляем клавиатуру — день теперь покажется с 🚫
+        await call.message.edit_reply_markup(reply_markup=schedule_days_kb(month, act))
+    elif act == "uday":
+        unblock_day(key)
+        await call.answer(f"✅ День {day} {MONTHS[month]} разблокирован")
+        await call.message.edit_reply_markup(reply_markup=schedule_days_kb(month, act))
+    elif act in ("bslot", "uslot"):
+        await call.message.answer(f"Выберите часы для {day} {MONTHS[month]}:",
+                                  reply_markup=schedule_slots_kb(month, day, act))
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("ss_"))
+async def schedule_slot_pick(call: types.CallbackQuery):
+    _, rest            = call.data.split("_", 1)
+    parts              = rest.split(":")
+    act, mon, day, raw = parts[0], parts[1], parts[2], parts[3]
+    month, day         = int(mon), int(day)
+    time_str           = raw[:2] + ":" + raw[2:]
+    key                = date_key(datetime.now().year, month, day)
+
+    if act == "bslot":
+        block_slot(key, time_str)
+        await call.answer(f"🔒 {time_str} заблокировано")
+    elif act == "uslot":
+        unblock_slot(key, time_str)
+        await call.answer(f"🔓 {time_str} разблокировано")
+
+    await call.message.edit_reply_markup(reply_markup=schedule_slots_kb(month, day, act))
+
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_cb(call: types.CallbackQuery):
+    await call.answer()
+
+# ─── Напоминания ─────────────────────────────────────────────────────────────
+
+async def reminder_loop():
+    """Каждые 5 минут проверяем брони и отправляем напоминания за 24ч и 2ч."""
+    while True:
+        try:
+            now = datetime.now()
+            con = db_connect()
+            cur = con.execute(
+                "SELECT * FROM bookings WHERE reminded_24=0 OR reminded_2=0"
+            )
+            rows = cur.fetchall()
+            con.close()
+
+            for row in rows:
+                b = _row_to_booking(row)
+                # Собираем datetime записи
+                try:
+                    appt = datetime(b["year"], b["month"], b["day"],
+                                    int(b["time"].split(":")[0]),
+                                    int(b["time"].split(":")[1]))
+                except Exception:
+                    continue
+
+                delta = appt - now
+                total_minutes = delta.total_seconds() / 60
+                svc = get_service(b["service"])
+                dur = svc["duration"] if svc else ""
+
+                # Напоминание за 24 часа (от 23:50 до 24:10)
+                if not b["reminded_24"] and 1430 <= total_minutes <= 1450:
+                    try:
+                        await bot.send_message(
+                            b["user_id"],
+                            f"🔔 Напоминание!\n\n"
+                            f"Завтра у вас запись:\n"
+                            f"💅 {b['service']} ({dur})\n"
+                            f"📅 {b['day']} {MONTHS[b['month']]} {b['year']}\n"
+                            f"🕐 {b['time']}\n\n"
+                            f"📍 {CONTACTS_SHORT}"
+                        )
+                        con2 = db_connect()
+                        con2.execute("UPDATE bookings SET reminded_24=1 WHERE id=?", (b["id"],))
+                        con2.commit(); con2.close()
+                    except Exception:
+                        pass
+
+                # Напоминание за 2 часа (от 1:50 до 2:10)
+                if not b["reminded_2"] and 110 <= total_minutes <= 130:
+                    try:
+                        await bot.send_message(
+                            b["user_id"],
+                            f"⏰ Через 2 часа ваша запись!\n\n"
+                            f"💅 {b['service']} ({dur})\n"
+                            f"📅 {b['day']} {MONTHS[b['month']]} {b['year']}\n"
+                            f"🕐 {b['time']}\n\n"
+                            f"📍 {CONTACTS_SHORT}"
+                        )
+                        con2 = db_connect()
+                        con2.execute("UPDATE bookings SET reminded_2=1 WHERE id=?", (b["id"],))
+                        con2.commit(); con2.close()
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            print(f"Reminder error: {e}")
+
+        await asyncio.sleep(300)  # каждые 5 минут
+
+
+# ─── Запуск ───────────────────────────────────────────────────────────────────
+
+async def on_startup(bot: Bot):
+    asyncio.create_task(reminder_loop())
+
+
 async def main():
+    dp.startup.register(on_startup)
     print("Бот запущен!")
     await dp.start_polling(bot)
 
