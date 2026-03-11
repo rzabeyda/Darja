@@ -1,6 +1,12 @@
-venv/
+# Секретные данные — никогда не пушить!
+.env
+
+# Файл с бронями
+bookings.json
+
+# Python
 __pycache__/
 *.pyc
-booking.db
-bookings.json
-.idea/
+*.pyo
+venv/
+.venv/

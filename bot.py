@@ -194,31 +194,30 @@ CONTACTS_FULL = (
 
 CONTACTS_SHORT = (
     "📞 +372 56 602 890\n"
-    "🏠 Linnamäe tee 83-66\n"
     "💬 Telegram: @Vi_da_ch_iV"
 )
 
 # ─── Услуги ───────────────────────────────────────────────────────────────────
 
 services = [
-    {"name": "Классический маникюр",            "price": "15€", "duration": "30 мин", "duration_slots": 1, "img": "images/klas.jpg"},
-    {"name": "Маникюр с гель-лаком / Коррекция","price": "25€", "duration": "60 мин", "duration_slots": 1, "img": "images/gel.jpg"},
-    {"name": "Наращивание ногтей",               "price": "35€", "duration": "120 мин","duration_slots": 2, "img": "images/nara.jpg"},
-    {"name": "Гигиенический педикюр",            "price": "25€", "duration": "45 мин", "duration_slots": 1, "img": "images/pedik.jpg"},
-    {"name": "Педикюр с гель-лаком",             "price": "35€", "duration": "60 мин", "duration_slots": 1, "img": "images/pedik_gel.jpg"},
-    {"name": "Мужской педикюр",                  "price": "30€", "duration": "60 мин", "duration_slots": 1, "img": "images/spa.jpg"},
-    {"name": "Снятие покрытия",                  "price": "10€", "duration": "15 мин", "duration_slots": 1, "img": "images/del.jpg"},
-    {"name": "Ремонт одного ногтя",              "price": "2€",  "duration": "15 мин", "duration_slots": 1, "img": "images/del.jpg"},
+    {"name": "Классический маникюр",    "price": "15€", "duration": "30 мин",  "duration_slots": 1, "img": "images/1.jpg"},
+    {"name": "Гель-лак / Коррекция",    "price": "25€", "duration": "60 мин",  "duration_slots": 1, "img": "images/2.jpg"},
+    {"name": "Наращивание ногтей",       "price": "35€", "duration": "120 мин", "duration_slots": 2, "img": "images/3.jpg"},
+    {"name": "Гигиенический педикюр",    "price": "25€", "duration": "45 мин",  "duration_slots": 1, "img": "images/4.jpg"},
+    {"name": "Педикюр с гель-лаком",    "price": "35€", "duration": "60 мин",  "duration_slots": 1, "img": "images/5.jpg"},
+    {"name": "Мужской педикюр",         "price": "30€", "duration": "60 мин",  "duration_slots": 1, "img": "images/6.jpg"},
+    {"name": "Снятие покрытия",         "price": "10€", "duration": "15 мин",  "duration_slots": 1, "img": "images/7.jpg"},
+    {"name": "Ремонт одного ногтя",     "price": "2€",  "duration": "15 мин",  "duration_slots": 1, "img": "images/8.jpg"},
 ]
 
 MONTHS = {
-    1: "Январь",   2: "Февраль", 3: "Март",    4: "Апрель",
-    5: "Май",      6: "Июнь",    7: "Июль",    8: "Август",
-    9: "Сентябрь", 10: "Октябрь",11: "Ноябрь", 12: "Декабрь",
+    1: "Января",   2: "Февраля", 3: "Марта",   4: "Апреля",
+    5: "Мая",      6: "Июня",    7: "Июля",    8: "Августа",
+    9: "Сентября", 10: "Октября",11: "Ноября", 12: "Декабря",
 }
 
 TIME_SLOTS = ["09:00","10:00","11:00","12:00","13:00",
-              "14:00","15:00","16:00","17:00"]
+              "14:00","15:00","16:00","17:00","18:00"]
 
 # ─── FSM ──────────────────────────────────────────────────────────────────────
 
@@ -257,7 +256,6 @@ def is_day_blocked(year: int, month: int, day: int) -> bool:
 
 
 def duration_minutes(svc: dict | None) -> int:
-    """Извлекает минуты из строки duration, например '30 мин' -> 30, '120 мин' -> 120."""
     if not svc:
         return 60
     import re
@@ -265,14 +263,12 @@ def duration_minutes(svc: dict | None) -> int:
     return int(m.group(1)) if m else 60
 
 def get_end_time(start_slot: str, duration_minutes: int) -> str:
-    """duration_minutes — реальная длительность в минутах."""
     h, m = int(start_slot.split(":")[0]), int(start_slot.split(":")[1])
     total = h * 60 + m + duration_minutes
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
 def get_busy_indices(year: int, month: int, day: int, exclude_bid: int | None = None) -> set[int]:
-    """Индексы слотов реально занятых существующими бронями."""
     busy = set()
     for b in get_all_bookings():
         if exclude_bid and b["id"] == exclude_bid:
@@ -290,22 +286,18 @@ def get_busy_indices(year: int, month: int, day: int, exclude_bid: int | None = 
 
 def get_blocked_slots(year: int, month: int, day: int, exclude_bid: int | None = None,
                       new_duration_slots: int = 1) -> set[str]:
-    """Слот S заблокирован если диапазон [S..S+dur-1] пересекается с занятыми."""
     now = datetime.now()
     blocked = set()
 
-    # 1. Прошедшее время сегодня
     if year == now.year and month == now.month and day == now.day:
         for slot in TIME_SLOTS:
             if int(slot.split(":")[0]) <= now.hour:
                 blocked.add(slot)
 
-    # 2. Мастер заблокировал вручную
     key = date_key(year, month, day)
     for slot in get_blocked_slots_for_date(key):
         blocked.add(slot)
 
-    # 3. Пересечение с существующими бронями
     busy = get_busy_indices(year, month, day, exclude_bid)
     for s_idx in range(len(TIME_SLOTS)):
         new_range = set(range(s_idx, s_idx + new_duration_slots))
@@ -316,20 +308,19 @@ def get_blocked_slots(year: int, month: int, day: int, exclude_bid: int | None =
 
 
 
-def format_booking(b: dict, idx: int | None = None) -> str:
+def format_booking(b: dict, idx: int | None = None, username: str | None = None) -> str:
     month_name = MONTHS[b["month"]]
     prefix     = f"Бронь №{idx}\n" if idx else ""
     svc        = get_service(b["service"])
-    dur_slots  = svc["duration_slots"] if svc else 1
     dur_str    = svc["duration"] if svc else ""
-    end_time   = get_end_time(b["time"], duration_minutes(svc))
+    tg_line    = f" | 💬 @{username}" if username else ""
+    addr_line = "\n😊 Я жду вас по адресу:\n🏠 Linnamäe tee 83-66" if not username else ""
     return (
         f"{prefix}"
-        f"💅 {b['service']} ({dur_str})\n"
-        f"📅 {b['day']} {month_name} {b['year']}\n"
-        f"🕐 {b['time']} — {end_time}\n"
+        f"💅 {b['service']} (~{dur_str})\n"
+        f"⏱ {b['time']} | {b['day']} {month_name}\n"
         f"👤 {b['name']}\n"
-        f"📞 {b['phone']}"
+        f"📞 {b['phone']}{tg_line}{addr_line}"
     ).strip()
 
 
@@ -350,7 +341,7 @@ def bottom_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
 def main_menu_kb():
     rows = []
     for s in services:
-        label = f"{s['name']} — {s['price']} ({s['duration']})"
+        label = f"{s['name']} — {s['price']} (~{s['duration']})"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"svc:{s['name']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -388,16 +379,13 @@ def days_kb(year: int, month: int, new_duration_slots: int = 1) -> InlineKeyboar
     _, days_in_month = calendar.monthrange(year, month)
     rows, row = [], []
     for day in range(1, days_in_month + 1):
-        # Пропускаем прошедшие дни
         if year == now.year and month == now.month and day < now.day:
             continue
-        # Пропускаем заблокированные дни
         if is_day_blocked(year, month, day):
             continue
-        # Пропускаем дни где нет свободного времени
         free = get_blocked_slots(year, month, day, new_duration_slots=new_duration_slots)
         all_slots = set(TIME_SLOTS)
-        if all_slots <= free:  # все слоты заняты
+        if all_slots <= free:
             continue
         row.append(InlineKeyboardButton(text=str(day), callback_data=f"day:{day}"))
         if len(row) == 7:
@@ -443,8 +431,9 @@ def booking_list_kb(user_id: int) -> InlineKeyboardMarkup:
     user_bookings = get_user_bookings(user_id)
     rows = []
     for b in user_bookings:
-        label = f"💅 {b['service'][:20]}  {b['day']} {MONTHS[b['month']]} {b['time']}"
+        label = f"{b['time']} {b['day']} {MONTHS[b['month']]}  {b['service'][:18]}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"viewb:{b['id']}")])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить все брони", callback_data="del_all_confirm")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -473,7 +462,7 @@ def edit_options_kb(bid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💅 Изменить услугу",  callback_data=f"efield:service:{bid}")],
         [InlineKeyboardButton(text="📅 Изменить дату",    callback_data=f"efield:date:{bid}")],
-        [InlineKeyboardButton(text="🕐 Изменить время",   callback_data=f"efield:time:{bid}")],
+        [InlineKeyboardButton(text="⏱ Изменить время",   callback_data=f"efield:time:{bid}")],
         [InlineKeyboardButton(text="👤 Изменить имя",     callback_data=f"efield:name:{bid}")],
         [InlineKeyboardButton(text="📞 Изменить телефон", callback_data=f"efield:phone:{bid}")],
         [InlineKeyboardButton(text="◀️ Назад",            callback_data=f"viewb:{bid}")],
@@ -483,7 +472,7 @@ def edit_options_kb(bid: int) -> InlineKeyboardMarkup:
 def services_edit_kb(bid: int) -> InlineKeyboardMarkup:
     rows = []
     for s in services:
-        label = f"{s['name']} — {s['price']} ({s['duration']})"
+        label = f"{s['name']} — {s['price']} (~{s['duration']})"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"esvc:{bid}:{s['name']}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"edit_booking:{bid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -505,6 +494,7 @@ def schedule_main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚫 Заблокировать часы",   callback_data="sched_block_slots")],
         [InlineKeyboardButton(text="✅ Разблокировать часы",  callback_data="sched_unblock_slots")],
         [InlineKeyboardButton(text="📋 Показать расписание",  callback_data="sched_show")],
+        [InlineKeyboardButton(text="🔓 Разблокировать всё",   callback_data="sched_unblock_all_confirm")],
         [InlineKeyboardButton(text="◀️ Назад",                callback_data="admin_back")],
     ])
 
@@ -550,7 +540,6 @@ def schedule_slots_kb(month: int, day: int, action: str) -> InlineKeyboardMarkup
     year           = datetime.now().year
     key            = date_key(year, month, day)
     blocked_manual = get_blocked_slots_for_date(key)
-    # Слоты занятые клиентами
     booked_slots = set()
     for b in get_all_bookings():
         if b["year"] == year and b["month"] == month and b["day"] == day:
@@ -703,6 +692,33 @@ async def confirm_delete(call: types.CallbackQuery):
     await call.answer()
 
 
+# ─── Удалить все брони ───────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "del_all_confirm")
+async def del_all_confirm(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить все", callback_data="del_all_yes"),
+        InlineKeyboardButton(text="❌ Отмена",           callback_data="my_booking"),
+    ]])
+    await call.message.answer("❗️ Вы уверены? Все ваши брони будут удалены!", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "del_all_yes")
+async def del_all_yes(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    bookings = get_user_bookings(user_id)
+    for b in bookings:
+        remove_booking(b["id"])
+        for _aid in ADMIN_IDS:
+            try:
+                await bot.send_message(_aid, f"🗑 Клиент удалил все брони!\n\n{format_booking(b)}")
+            except Exception:
+                pass
+    await call.message.answer("✅ Все брони удалены.", reply_markup=back_to_menu_kb())
+    await call.answer()
+
+
 # ─── Редактирование брони ─────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("edit_booking:"))
@@ -850,8 +866,6 @@ async def service_choice(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-
-
 @dp.callback_query(F.data == "back_to_months")
 async def back_to_months(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -897,8 +911,11 @@ async def day_choice(call: types.CallbackQuery, state: FSMContext):
     await state.update_data(day=day)
     svc_data = get_service(data.get("service", ""))
     new_dur  = svc_data["duration_slots"] if svc_data else 1
-    await call.message.answer("Выберите удобное время:",
-                               reply_markup=time_kb(year, month, day, new_duration_slots=new_dur))
+    month_name = MONTHS[month] if month else ""
+    await call.message.answer(
+        f"✅ Вы выбрали: {day} {month_name}\n\nВыберите удобное время:",
+        reply_markup=time_kb(year, month, day, new_duration_slots=new_dur)
+    )
     await state.set_state(Booking.time)
     await call.answer()
 
@@ -908,7 +925,7 @@ async def time_choice(call: types.CallbackQuery, state: FSMContext):
     raw      = call.data[2:]
     time_str = raw[:2] + ":" + raw[2:]
     await state.update_data(time=time_str)
-    await call.message.answer("Введите ваше имя:")
+    await call.message.answer(f"✅ Вы выбрали: {time_str}\n\nВведите ваше имя:")
     await state.set_state(Booking.name)
     await call.answer()
 
@@ -922,10 +939,13 @@ async def enter_name(message: types.Message, state: FSMContext):
 
 @dp.message(Booking.phone)
 async def enter_phone(message: types.Message, state: FSMContext):
+    import re
+    if re.search(r"[a-zA-Zа-яА-ЯёЁ]", message.text or ""):
+        await message.answer("⚠️ Номер телефона не должен содержать буквы. Попробуйте ещё раз:")
+        return
     data    = await state.get_data()
     user_id = message.from_user.id
 
-    # Финальная проверка на сервере — слот ещё свободен?
     svc_chk  = get_service(data.get("service", ""))
     dur_chk  = svc_chk["duration_slots"] if svc_chk else 1
     yr  = data.get("year") or datetime.now().year
@@ -961,24 +981,25 @@ async def enter_phone(message: types.Message, state: FSMContext):
 
     svc      = get_service(data["service"])
     dur      = svc["duration"] if svc else ""
-    end_time = get_end_time(data["time"], duration_minutes(svc))
 
     await message.answer(
         f"✅ Бронь подтверждена!\n\n"
-        f"{format_booking(b)}\n\n"
+        f"{format_booking(b)}\n"
+        f"🏠 Linnamäe tee 83-66\n\n"
         f"━━━━━━━━━━━━━━━━━\n"
-        f"📍 Контакты мастера:\n{CONTACTS_SHORT}",
+        f"📍 Контакты Дарьи:\n{CONTACTS_SHORT}",
         reply_markup=back_to_menu_kb()
     )
+    tg_username = message.from_user.username
+    tg_line = f"\n💬 @{tg_username}" if tg_username else ""
     for _aid in ADMIN_IDS:
         await bot.send_message(
             _aid,
             f"🔔 Новая бронь!\n\n"
-            f"💅 {data['service']} ({dur})\n"
-            f"📅 {data['day']} {MONTHS[data['month']]} {data['year']}\n"
-            f"🕐 {data['time']}—{end_time}\n"
+            f"💅 {data['service']} (~{dur})\n"
+            f"⏱ {data['time']} | {data['day']} {MONTHS[data['month']]}\n"
             f"👤 {data['name']}\n"
-            f"📞 {message.text}"
+            f"📞 {message.text}{tg_line}"
         )
     await state.clear()
 
@@ -996,12 +1017,10 @@ async def admin_view_booking(call: types.CallbackQuery):
         await call.answer("Бронь не найдена.", show_alert=True); return
     svc      = get_service(b["service"])
     dur      = svc["duration"] if svc else ""
-    end_time = get_end_time(b["time"], duration_minutes(svc))
     text = (
         f"📋 Бронь #{bid}\n\n"
-        f"💅 {b['service']} ({dur})\n"
-        f"📅 {b['day']} {MONTHS[b['month']]} {b['year']}\n"
-        f"🕐 {b['time']} — {end_time}\n"
+        f"💅 {b['service']} (~{dur})\n"
+        f"⏱ {b['time']} | {b['day']} {MONTHS[b['month']]}\n"
         f"👤 {b['name']}\n"
         f"📞 {b['phone']}"
     )
@@ -1030,10 +1049,9 @@ async def admin_actions(call: types.CallbackQuery, state: FSMContext):
         for i, b in enumerate(all_b, 1):
             svc      = get_service(b["service"])
             dur      = svc["duration"] if svc else ""
-            end_time = get_end_time(b["time"], duration_minutes(svc))
-            text += (f"#{i} | {b['day']} {MONTHS[b['month']]} {b['year']} {b['time']}—{end_time}\n"
-                     f"💅 {b['service']} ({dur})\n"
-                     f"👤 {b['name']} | 📞 {b['phone']}\n\n")
+            text += (f"💅 {b['service']} (~{dur})\n"
+                     f"⏱ {b['time']} | {b['day']} {MONTHS[b['month']]}\n"
+                     f"👤 {b['name']} 📞 {b['phone']}\n\n")
             rows.append([InlineKeyboardButton(
                 text=f"👁 #{i} — {b['name']} | {b['day']} {MONTHS[b['month']]} {b['time']}",
                 callback_data=f"admin_view:{b['id']}"
@@ -1053,9 +1071,9 @@ async def admin_actions(call: types.CallbackQuery, state: FSMContext):
             for b in today_b:
                 svc      = get_service(b["service"])
                 dur      = svc["duration"] if svc else ""
-                end_time = get_end_time(b["time"], duration_minutes(svc))
-                text += (f"🕐 {b['time']}—{end_time} | {b['service']} ({dur})\n"
-                         f"👤 {b['name']} | 📞 {b['phone']}\n\n")
+                text += (f"💅 {b['service']} (~{dur})\n"
+                         f"⏱ {b['time']} | {b['day']} {MONTHS[b['month']]}\n"
+                         f"👤 {b['name']} 📞 {b['phone']}\n\n")
                 rows.append([InlineKeyboardButton(
                     text=f"👁 {b['time']} — {b['name']}",
                     callback_data=f"admin_view:{b['id']}"
@@ -1075,9 +1093,9 @@ async def admin_actions(call: types.CallbackQuery, state: FSMContext):
             for b in tom_b:
                 svc      = get_service(b["service"])
                 dur      = svc["duration"] if svc else ""
-                end_time = get_end_time(b["time"], duration_minutes(svc))
-                text += (f"🕐 {b['time']}—{end_time} | {b['service']} ({dur})\n"
-                         f"👤 {b['name']} | 📞 {b['phone']}\n\n")
+                text += (f"💅 {b['service']} (~{dur})\n"
+                         f"⏱ {b['time']} | {b['day']} {MONTHS[b['month']]}\n"
+                         f"👤 {b['name']} 📞 {b['phone']}\n\n")
                 rows.append([InlineKeyboardButton(
                     text=f"👁 {b['time']} — {b['name']}",
                     callback_data=f"admin_view:{b['id']}"
@@ -1127,6 +1145,17 @@ async def schedule_actions(call: types.CallbackQuery):
         await call.message.answer("Выберите месяц:", reply_markup=schedule_months_kb("bslot"))
     elif action == "sched_unblock_slots":
         await call.message.answer("Выберите месяц:", reply_markup=schedule_months_kb("uslot"))
+    elif action == "sched_unblock_all_confirm":
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да, разблокировать всё", callback_data="sched_unblock_all_yes"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="admin_schedule"),
+        ]])
+        await call.message.answer("❗️ Разблокировать все дни и часы?", reply_markup=kb)
+    elif action == "sched_unblock_all_yes":
+        con = db_connect()
+        con.execute("DELETE FROM schedule")
+        con.commit(); con.close()
+        await call.message.answer("✅ Всё расписание разблокировано.", reply_markup=schedule_main_kb())
     elif action == "sched_show":
         blocked = get_blocked_days()
         slots   = get_all_blocked_slots()
@@ -1165,7 +1194,6 @@ async def schedule_day_pick(call: types.CallbackQuery):
     if act == "bday":
         block_day(key)
         await call.answer(f"🚫 День {day} {MONTHS[month]} заблокирован")
-        # Обновляем клавиатуру — день теперь покажется с 🚫
         await call.message.edit_reply_markup(reply_markup=schedule_days_kb(month, act))
     elif act == "uday":
         unblock_day(key)
@@ -1196,7 +1224,6 @@ async def schedule_slot_pick(call: types.CallbackQuery):
     await call.message.edit_reply_markup(reply_markup=schedule_slots_kb(month, day, act))
 
 
-
 @dp.callback_query(F.data == "noop")
 async def noop_cb(call: types.CallbackQuery):
     await call.answer()
@@ -1204,7 +1231,6 @@ async def noop_cb(call: types.CallbackQuery):
 # ─── Напоминания ─────────────────────────────────────────────────────────────
 
 async def reminder_loop():
-    """Каждые 5 минут проверяем брони и отправляем напоминания за 24ч и 2ч."""
     while True:
         try:
             now = datetime.now()
@@ -1217,7 +1243,6 @@ async def reminder_loop():
 
             for row in rows:
                 b = _row_to_booking(row)
-                # Собираем datetime записи
                 try:
                     appt = datetime(b["year"], b["month"], b["day"],
                                     int(b["time"].split(":")[0]),
@@ -1230,7 +1255,6 @@ async def reminder_loop():
                 svc = get_service(b["service"])
                 dur = svc["duration"] if svc else ""
 
-                # Напоминание за 24 часа (от 23:50 до 24:10)
                 if not b["reminded_24"] and 1430 <= total_minutes <= 1450:
                     try:
                         await bot.send_message(
@@ -1239,7 +1263,7 @@ async def reminder_loop():
                             f"Завтра у вас запись:\n"
                             f"💅 {b['service']} ({dur})\n"
                             f"📅 {b['day']} {MONTHS[b['month']]} {b['year']}\n"
-                            f"🕐 {b['time']}\n\n"
+                            f"⏱ {b['time']}\n\n"
                             f"📍 {CONTACTS_SHORT}"
                         )
                         con2 = db_connect()
@@ -1248,7 +1272,6 @@ async def reminder_loop():
                     except Exception:
                         pass
 
-                # Напоминание за 2 часа (от 1:50 до 2:10)
                 if not b["reminded_2"] and 110 <= total_minutes <= 130:
                     try:
                         await bot.send_message(
@@ -1256,7 +1279,7 @@ async def reminder_loop():
                             f"⏰ Через 2 часа ваша запись!\n\n"
                             f"💅 {b['service']} ({dur})\n"
                             f"📅 {b['day']} {MONTHS[b['month']]} {b['year']}\n"
-                            f"🕐 {b['time']}\n\n"
+                            f"⏱ {b['time']}\n\n"
                             f"📍 {CONTACTS_SHORT}"
                         )
                         con2 = db_connect()
@@ -1268,7 +1291,7 @@ async def reminder_loop():
         except Exception as e:
             print(f"Reminder error: {e}")
 
-        await asyncio.sleep(300)  # каждые 5 минут
+        await asyncio.sleep(300)
 
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
