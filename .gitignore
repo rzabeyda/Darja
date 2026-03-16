@@ -11,3 +11,8 @@ __pycache__/
 venv/
 .venv/
 bot.db 
+.env 
+.idea/ 
+booking.db 
+schedule.json 
+seed.py 
